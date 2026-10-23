@@ -1,0 +1,271 @@
+#define BLYNK_PRINT Serial
+#include <ESP8266WiFi.h>
+#include <BlynkSimpleEsp8266.h>
+#include <ArduinoOTA.h>          // 保留：區網 OTA 無線升級功能
+#include <ESP8266httpUpdate.h>    // 🌟 新增：HTTP 遠端網頁更新功能
+
+// ===== 憑證設定 =====
+char auth[] = "3548a218c714436e843ced9b8d98952f"; // 幼子魚池馬達控制 Token
+char ssid[] = "IOT"; // 遠端魚池的 Wi-Fi 名稱
+char pass[] = "0939201239"; // 遠端魚池的 Wi-Fi 密碼
+
+// 🌟 新增：設定您存放最新程式編譯檔（.bin）的網頁網址
+// 請記得將下方的網址替換成您在 githack 轉換出來的專屬 http 網址
+const String OTA_URL = "http://githack.com";
+
+// ===== 硬體腳位定義 =====
+#define PIN_VALVE_XIPU   4   // D2 溪埔水閥 (對應 V1)
+#define PIN_VALVE_HILL   12  // D6 山坡網室水閥 (對應 V2)
+#define PIN_VALVE_POND   14  // D5 魚池花園水閥 (對應 V3)
+#define PIN_PUMP         5   // D1 幫浦
+
+// 低電位觸發繼電器：HIGH=關閉，LOW=開啟
+#define RELAY_OFF HIGH
+#define RELAY_ON  LOW
+
+// ===== 時間常數 (毫秒) =====
+const unsigned long VALVE_OPEN_DELAY = 10 * 1000;      // 水閥預開10秒
+
+// ===== 非阻塞狀態機變數 =====
+unsigned long timerStart = 0;       
+int wateringStep = 0;               
+int currentValvePin = 0;            
+String currentLocation = "";       
+unsigned long currentPumpRunTime = 0; 
+
+// ===== 使用者設定變數 =====
+int pumpMinutes = 1; // 對應 App 的 V11
+
+// ===== 函數宣告 =====
+void processWatering();
+void emergencyStop();
+void showStatus(String msgV0, String msgV10);
+
+// ===== setup() =====
+void setup() {
+  Serial.begin(9600);
+  delay(1000); // 等待序列埠開啟
+  Serial.println("\n\n=========================");
+  Serial.println("🚀 機板啟動中... (已啟用雙模 OTA 功能)"); 
+  Serial.println("=========================");
+  
+  pinMode(PIN_VALVE_XIPU, OUTPUT);
+  pinMode(PIN_VALVE_HILL, OUTPUT);
+  pinMode(PIN_VALVE_POND, OUTPUT);
+  pinMode(PIN_PUMP, OUTPUT);
+  
+  digitalWrite(PIN_VALVE_XIPU, RELAY_OFF);
+  digitalWrite(PIN_VALVE_HILL, RELAY_OFF);
+  digitalWrite(PIN_VALVE_POND, RELAY_OFF);
+  digitalWrite(PIN_PUMP, RELAY_OFF);
+  
+  // 加入 WiFi 自動重連功能
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
+
+  Serial.println("正在連線至 Blynk 伺服器...");
+  
+  // 連接你的 Local Server
+  Blynk.begin(auth, ssid, pass, "182.61.28.31", 8080);
+  
+  // 🌟 保留：ArduinoOTA 內網無線升級初始化
+  ArduinoOTA.setHostname("fishpond_esp8266");
+  ArduinoOTA.begin();
+  
+  Serial.println("✅ Blynk 與 OTA 初始化完成！"); 
+  
+  Blynk.virtualWrite(V1, 0);
+  Blynk.virtualWrite(V2, 0);
+  Blynk.virtualWrite(V3, 0);
+  Blynk.virtualWrite(V4, 0);
+  Blynk.virtualWrite(V11, 1);
+}
+
+// ===== loop() 主迴圈 =====
+void loop() {
+  ArduinoOTA.handle(); // 🌟 保留：優先監聽內網 OTA 請求
+  Blynk.run();
+
+  // 檢查連線
+  if (!Blynk.connected()) {
+    digitalWrite(PIN_VALVE_XIPU, RELAY_OFF);
+    digitalWrite(PIN_VALVE_HILL, RELAY_OFF);
+    digitalWrite(PIN_VALVE_POND, RELAY_OFF);
+    digitalWrite(PIN_PUMP, RELAY_OFF);
+    wateringStep = 0; 
+    
+    static unsigned long lastSerialPrint = 0;
+    if (millis() - lastSerialPrint > 2000) {
+      lastSerialPrint = millis();
+      Serial.println("⚠️ 等待連線中... (請檢查熱點與伺服器 IP)");
+    }
+    return; 
+  }
+
+  // 連線成功，動態符號
+  static unsigned long lastUpdateTime = 0;
+  static int symbolIndex = 0;
+  
+  if (wateringStep == 0) {
+    if (millis() - lastUpdateTime > 1000) { 
+      lastUpdateTime = millis();
+      
+      String symbols[] = {"🌟","🟢", "🟡", "🔵",};
+      String currentSymbol = symbols[symbolIndex];
+      symbolIndex = (symbolIndex + 1) % 4; 
+      
+      Blynk.virtualWrite(V0, currentSymbol + " 瑞龍鳳梨 連線成功");
+      Blynk.virtualWrite(V10, currentSymbol + " 網路連結機板~等待手機指示");
+      
+      Serial.println("連線正常 " + currentSymbol);
+    }
+  }
+
+  // 處理澆水狀態機
+  if (wateringStep > 0) {
+    processWatering();
+  }
+}
+
+// ===== 非阻塞式澆水狀態機 =====
+void processWatering() {
+  unsigned long now = millis();
+  
+  switch(wateringStep) {
+    case 1:  
+      digitalWrite(currentValvePin, RELAY_ON);
+      showStatus(currentLocation + " 正要澆水", "打開" + currentLocation + "水閥10秒");
+      wateringStep = 2;
+      timerStart = now; 
+      break;
+      
+    case 2:  
+      if (now - timerStart >= VALVE_OPEN_DELAY) {
+        digitalWrite(PIN_PUMP, RELAY_ON);
+        showStatus(currentLocation + "澆水 水閥全開", "幫浦運轉 " + String(pumpMinutes) + " 分鐘");
+        wateringStep = 3;
+        timerStart = now; 
+      }
+      break;
+      
+    case 3:   
+      if (now - timerStart >= currentPumpRunTime) {
+        digitalWrite(PIN_PUMP, RELAY_OFF);
+        showStatus(currentLocation + " 幫浦已停止", "準備關閉水閥");
+        wateringStep = 4;
+        timerStart = now; 
+      }
+      break;
+      
+    case 4:  
+      if (now - timerStart >= 1000) {
+        digitalWrite(currentValvePin, RELAY_OFF);
+        showStatus(currentLocation + " 澆水完成", "所有閥門已關閉");
+        wateringStep = 0;  
+        currentValvePin = 0;
+      }
+      break;
+  }
+}
+
+// ===== 🚨 緊急停止功能 =====
+void emergencyStop() {
+  digitalWrite(PIN_VALVE_XIPU, RELAY_OFF);
+  digitalWrite(PIN_VALVE_HILL, RELAY_OFF);
+  digitalWrite(PIN_VALVE_POND, RELAY_OFF);
+  digitalWrite(PIN_PUMP, RELAY_OFF);
+  
+  wateringStep = 0;
+  currentValvePin = 0;
+  currentLocation = "";
+  
+  showStatus("🛑 緊急停止！", "已強制關閉所有水閥與幫浦");
+}
+
+// ===== 顯示輔助函數 =====
+void showStatus(String msgV0, String msgV10) {
+  Blynk.virtualWrite(V0, msgV0);
+  Blynk.virtualWrite(V10, msgV10);
+}
+
+// ===== Blynk 事件處理 =====
+BLYNK_WRITE(V1) { // 溪埔
+  if (param.asInt() == 1 && wateringStep == 0) {  
+    currentLocation = "溪埔";
+    currentValvePin = PIN_VALVE_XIPU;
+    currentPumpRunTime = (unsigned long)pumpMinutes * 60 * 1000;
+    wateringStep = 1;
+    Blynk.virtualWrite(V1, 0); 
+  }
+}
+
+BLYNK_WRITE(V2) { // 山坡網室
+  if (param.asInt() == 1 && wateringStep == 0) {
+    currentLocation = "山坡網室";
+    currentValvePin = PIN_VALVE_HILL;
+    currentPumpRunTime = (unsigned long)pumpMinutes * 60 * 1000;
+    wateringStep = 1;
+    Blynk.virtualWrite(V2, 0);
+  }
+}
+
+BLYNK_WRITE(V3) { // 魚池花園
+  if (param.asInt() == 1 && wateringStep == 0) {
+    currentLocation = "魚池花園";
+    currentValvePin = PIN_VALVE_POND;
+    currentPumpRunTime = (unsigned long)pumpMinutes * 60 * 1000;
+    wateringStep = 1;
+    Blynk.virtualWrite(V3, 0);
+  }
+}
+
+BLYNK_WRITE(V4) {  // 🚨 緊急停止
+  if (param.asInt() == 1) {
+    emergencyStop();
+    Blynk.virtualWrite(V4, 0); 
+  }
+}
+
+BLYNK_WRITE(V11) { // 定時器/步進器
+  pumpMinutes = param.asInt();
+  if (pumpMinutes < 1) pumpMinutes = 1; 
+}
+
+// ========================================================
+// 🌟 修正版：當您在家中按下齊護 App 上的 V25 「檢查更新」按鈕
+// ========================================================
+BLYNK_WRITE(V25) {
+  if (param.asInt() == 1) { 
+    // 在 App 畫面上顯示狀態
+    showStatus("正在遠端更新", "啟動 HTTP OTA 下載中...");
+    Serial.println("收到遠端 HTTP OTA 指令，準備連線至 GitHub 釋放資源...");
+
+    // 關閉 WiFi 客戶端安全檢查（使用 githack 轉換後的 http 連結下載）
+    WiFiClient client;
+    
+    // 🌟 修正處：將 ESP8266httpUpdate 變更為 ESPhttpUpdate
+    t_httpUpdate_return ret = ESPhttpUpdate.update(client, OTA_URL);
+
+    // 處理與回傳更新結果
+    switch(ret) {
+      case HTTP_UPDATE_FAILED:
+        // 🌟 修正處：ESP8266httpUpdate 改成 ESPhttpUpdate
+        showStatus("❌ 更新失敗", "原因: " + ESPhttpUpdate.getLastErrorString());
+        Serial.printf("HTTP_UPDATE_FAILD Error (%d): %s\n", ESPhttpUpdate.getLastError(), ESPhttpUpdate.getLastErrorString().c_str());
+        break;
+        
+      case HTTP_UPDATE_NO_UPDATES:
+        showStatus("ℹ️ 無新版本", "雲端伺服器上無更新檔案");
+        Serial.println("HTTP_UPDATE_NO_UPDATES");
+        break;
+        
+      case HTTP_UPDATE_OK:
+        showStatus("🎉 更新成功", "機板即將自動重啟");
+        Serial.println("HTTP_UPDATE_OK");
+        break;
+    }
+    
+    // 觸發完畢後將 App 上的更新按鈕彈回
+    Blynk.virtualWrite(V25, 0); 
+  }
+}
